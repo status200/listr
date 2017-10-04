@@ -1,5 +1,4 @@
 'use strict';
-const pMap = require('p-map');
 const Task = require('./lib/task');
 const TaskWrapper = require('./lib/task-wrapper');
 const renderer = require('./lib/renderer');
@@ -75,6 +74,17 @@ class Listr {
 		return this;
 	}
 
+	addDynamic(task) {
+		if (this._addDynamic === undefined) {
+			throw new Error('`addDynamic` method only available while the list is running');
+		}
+		const tasks = Array.isArray(task) ? task : [task];
+		for (const task of tasks) {
+			this._addDynamic(task);
+		}
+		return this;
+	}
+
 	render() {
 		if (!this._renderer) {
 			this._renderer = new this._RendererClass(this._tasks, this._options);
@@ -92,12 +102,65 @@ class Listr {
 
 		this._checkAll(context);
 
-		const tasks = pMap(this._tasks, task => {
-			this._checkAll(context);
-			return runTask(task, context, errors);
-		}, {concurrency: this.concurrency});
+		const runner = new Promise((resolve, reject) => {
+			const results = [];
+			const taskList = {};
+			const taskState = {};
+			this._tasks.forEach((task, i) => {
+				const symbol = Symbol(`task_${i}`);
+				taskList[symbol] = i;
+				taskState[symbol] = 0;
+			});
+			const waiting = () => {
+				return Object.getOwnPropertySymbols(taskState).filter(key => {
+					return taskState[key] === 0;
+				});
+			};
+			const inProgress = () => {
+				return Object.getOwnPropertySymbols(taskState).filter(key => {
+					return taskState[key] === 1;
+				});
+			};
+			const done = () => {
+				return Object.getOwnPropertySymbols(taskState).filter(key => {
+					return taskState[key] === 2;
+				});
+			};
+			const execute = () => {
+				let limit = this.concurrency;
+				if (this.concurrency === Infinity) {
+					limit = Infinity;
+				}
+				for (let i = inProgress().length; i < limit; i++) {
+					const nextSymbol = waiting()[0];
+					if (nextSymbol === undefined) {
+						if (Object.getOwnPropertySymbols(taskList).length === done().length) {
+							delete this._addDynamic;
+							return resolve(results);
+						}
+						break;
+					}
+					taskState[nextSymbol] = 1;
+					this._checkAll(context);
+					runTask(this._tasks[taskList[nextSymbol]], context, errors).then(result => {
+						results.push(result);
+						taskState[nextSymbol] = 2;
+						execute();
+					}).catch(reject);
+				}
+			};
+			execute();
+			this._addDynamic = task => {
+				this.add(task);
+				const position = this._tasks.length - 1;
+				const symbol = Symbol(`task_${position}`);
+				taskList[symbol] = position;
+				taskState[symbol] = 0;
+				execute();
+			};
+		});
 
-		return tasks
+		return runner
 			.then(() => {
 				if (errors.length > 0) {
 					const err = new ListrError('Something went wrong');
